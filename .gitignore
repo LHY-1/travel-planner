@@ -6,13 +6,20 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+*.bak_*
 
-# Node
+# Node (not needed for deploy)
 node_modules/
+package.json
+package-lock.json
+
+# Scripts (not needed for deploy - no Playwright)
+scripts/
 
 # Runtime data
 runtime_data/
 browser_state/
+data/
 *.log
 api_debug*.log
 uvicorn*.log
@@ -31,13 +38,25 @@ Thumbs.db
 .env
 .env.local
 
-# Test files
+# Test and debug files
 test_*.py
+test_*.sh
+test_*.bat
+test_*.json
+test_*.md
 debug_*.py
 *_debug/
 debug_*.json
+check_*.py
+fix_*.py
+update_*.py
+add_*.py
+show_*.py
+simplify_*.py
+setup_*.sh
 
 # Misc
 cloudflared.exe
 cloudflared.msi
 *.bat
+._*

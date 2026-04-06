@@ -1,31 +1,27 @@
+"""Tongcheng Provider - API-only version for cloud deployment."""
 from __future__ import annotations
 
-import asyncio
 import json
 import os
-import subprocess
 import time
 import uuid
-from http.cookies import SimpleCookie
 from pathlib import Path
-from subprocess import TimeoutExpired
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import httpx
 
-from app.config.settings import TONGCHENG_STORAGE_STATE, TONGCHENG_USE_BROWSER, BASE_DIR
+from app.config.settings import BASE_DIR
 from app.providers.base import BaseTravelProvider
 from app.schemas.domain import TransportOption, CityFeature
 
 
 class TongchengProvider(BaseTravelProvider):
+    """同程航班查询 - 仅 API 模式，无浏览器依赖。"""
+
     def __init__(self, timeout: float = 15.0):
         self.timeout = timeout
         self.project_dir = Path(BASE_DIR)
-        self.headless = os.getenv("TONGCHENG_HEADLESS", "1") == "1"
-        self.transport_script = self.project_dir / "scripts" / "search_tongcheng_transport.js"
-        self.hotel_script = self.project_dir / "scripts" / "search_tongcheng_hotels.js"
         self.city_codes = {
             "西安": "SIA",
             "北京": "PEK",
@@ -41,22 +37,13 @@ class TongchengProvider(BaseTravelProvider):
             "长沙": "CSX",
             "青岛": "TAO",
         }
-        self.auth = self._load_auth_from_storage()
-
-    # ── 公开接口 ──────────────────────────────────────────────────────────────
+        # 从环境变量读取 token（可选）
+        self.tcsectoken = os.getenv("TONGCHENG_TOKEN", "")
+        self.user_id = os.getenv("TONGCHENG_USER_ID", "0")
 
     async def search_single_flight(self, from_city: str, to_city: str, travel_date: str) -> dict:
-        """先走 httpx API，失败或无结果再降级到 Playwright browser。"""
-        api_data = await self._search_single_flight_api(from_city, to_city, travel_date)
-        if api_data.get("count", 0) > 0:
-            return api_data
-
-        if TONGCHENG_USE_BROWSER:
-            browser_data = await self._search_single_flight_browser(from_city, to_city, travel_date)
-            if browser_data.get("count", 0) > 0:
-                return browser_data
-
-        return api_data
+        """直接调用 httpx API。"""
+        return await self._search_single_flight_api(from_city, to_city, travel_date)
 
     async def get_transport_matrix(
         self, cities: List[str], travel_date: Optional[str] = None
@@ -94,9 +81,8 @@ class TongchengProvider(BaseTravelProvider):
     async def get_city_features(self, cities: List[str], days: int) -> Dict[str, CityFeature]:
         result: Dict[str, CityFeature] = {}
         for city in cities:
-            raw = self._run_node_script(self.hotel_script, [city, "today"])
-            hotel_cost = self._parse_hotel_cost(raw)
-            result[city] = CityFeature(city=city, experience_score=70.0, hotel_cost=hotel_cost, stay_hours=8)
+            # 简化：使用默认酒店成本
+            result[city] = CityFeature(city=city, experience_score=70.0, hotel_cost=260.0, stay_hours=8)
         return result
 
     def build_booking_url(self, from_city: str, to_city: str, travel_date: str) -> str:
@@ -110,7 +96,7 @@ class TongchengProvider(BaseTravelProvider):
             )
         return f"https://www.ly.com/flights/itinerary/oneway/?date={travel_date}&from={quote(from_city)}&to={quote(to_city)}"
 
-    # ── httpx API 直查（主路径）──────────────────────────────────────────────
+    # ── httpx API 直查 ────────────────────────────────────────────────────────
 
     async def _search_single_flight_api(self, from_city: str, to_city: str, travel_date: str) -> dict:
         from_code = self.city_codes.get(from_city)
@@ -168,15 +154,10 @@ class TongchengProvider(BaseTravelProvider):
 
     def _build_api_headers(self, from_city: str, to_city: str, travel_date: str) -> dict:
         now_ms = str(int(time.time() * 1000))
-        user_id = self.auth.get("user_id", "0")
-        token = self.auth.get("tcsectoken", "")
-        return {
+        headers = {
             "accept": "application/json, text/plain, */*",
             "content-type": "application/json;charset=UTF-8",
             "referer": self.build_booking_url(from_city, to_city, travel_date),
-            "tcsectoken": token,
-            "tcsessionid": f"{user_id}-{now_ms}",
-            "tctracerid": f"{user_id}-{now_ms}",
             "tcplat": "1",
             "tcversion": "1.1.0",
             "user-agent": (
@@ -184,36 +165,11 @@ class TongchengProvider(BaseTravelProvider):
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
             ),
         }
-
-    def _load_auth_from_storage(self) -> dict:
-        path = Path(TONGCHENG_STORAGE_STATE)
-        if not path.exists():
-            return {}
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-
-        cookies = {c.get("name"): c.get("value", "") for c in raw.get("cookies", [])}
-        cn_user = cookies.get("cnUser", "")
-        parsed_cn = self._parse_query_like_cookie(cn_user)
-        token = parsed_cn.get("token", "")
-        user_id = parsed_cn.get("userid", "")
-        if not token:
-            wx_user = cookies.get("WxUser", "")
-            parsed_wx = self._parse_query_like_cookie(wx_user)
-            token = parsed_wx.get("sectoken", "")
-        if not user_id:
-            user_id = self._parse_query_like_cookie(cookies.get("us", "")).get("userid", "0")
-        return {"tcsectoken": token, "user_id": user_id or "0"}
-
-    def _parse_query_like_cookie(self, value: str) -> dict:
-        out = {}
-        for part in (value or "").split("&"):
-            if "=" in part:
-                k, v = part.split("=", 1)
-                out[k] = v
-        return out
+        if self.tcsectoken:
+            headers["tcsectoken"] = self.tcsectoken
+            headers["tcsessionid"] = f"{self.user_id}-{now_ms}"
+            headers["tctracerid"] = f"{self.user_id}-{now_ms}"
+        return headers
 
     def _parse_flight_list_response(
         self, raw: dict, from_city: str, to_city: str, travel_date: str
@@ -275,139 +231,6 @@ class TongchengProvider(BaseTravelProvider):
                 pass
         return total
 
-    # ── Playwright browser 降级（异步）──────────────────────────────────────
-
-    async def _search_single_flight_browser(self, from_city: str, to_city: str, travel_date: str) -> dict:
-        raw = await self._run_node_script_async(
-            self.transport_script, [from_city, to_city, travel_date], timeout=45.0
-        )
-        parsed = self._parse_transport_result(from_city, to_city, raw)
-        booking_url = raw.get("knownUrl") or self.build_booking_url(from_city, to_city, travel_date)
-        enriched = []
-        raw_items = raw.get("transport", [])
-        for idx, x in enumerate(parsed):
-            item = raw_items[idx] if idx < len(raw_items) else {}
-            enriched.append({
-                "from_city": x.from_city,
-                "to_city": x.to_city,
-                "mode": x.mode,
-                "price": x.price,
-                "duration_min": x.duration_min,
-                "comfort_score": x.comfort_score,
-                "transfer_count": x.transfer_count,
-                "airline": item.get("airline", ""),
-                "flight_no": item.get("flight_no", ""),
-                "depart_time": item.get("depart_time", ""),
-                "arrive_time": item.get("arrive_time", ""),
-                "depart_airport": item.get("depart_airport", ""),
-                "arrive_airport": item.get("arrive_airport", ""),
-                "duration_text": item.get("duration_text", ""),
-                "meal": item.get("meal", ""),
-                "discount_text": item.get("discount_text", ""),
-                "booking_url": item.get("booking_url") or booking_url,
-            })
-        return {
-            "query": {"from_city": from_city, "to_city": to_city, "travel_date": travel_date},
-            "debug": raw.get("debug", {}),
-            "raw": raw,
-            "parsed": enriched,
-            "count": len(parsed),
-            "booking_url": booking_url,
-        }
-
-    # ── Node.js 脚本调用（同步 + 异步）──────────────────────────────────────
-
-    def _run_node_script(self, script: Path, args: List[str], timeout: Optional[float] = None) -> dict:
-        env = dict(**os.environ)
-        env["TONGCHENG_STORAGE_STATE"] = TONGCHENG_STORAGE_STATE
-        env["TONGCHENG_HEADLESS"] = "1" if self.headless else "0"
-        try:
-            proc = subprocess.run(
-                ["node", str(script), *args],
-                cwd=str(self.project_dir),
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout or self.timeout,
-                env=env,
-            )
-            output = proc.stdout.strip() or proc.stderr.strip() or "{}"
-            try:
-                return json.loads(output)
-            except json.JSONDecodeError:
-                return {"raw": output, "error": "invalid_json"}
-        except TimeoutExpired as e:
-            return {
-                "error": "timeout",
-                "message": str(e),
-                "script": str(script),
-                "args": args,
-                "timeout": timeout or self.timeout,
-            }
-
-    async def _run_node_script_async(
-        self, script: Path, args: List[str], timeout: Optional[float] = None
-    ) -> dict:
-        """异步版本，不阻塞事件循环。"""
-        env = dict(**os.environ)
-        env["TONGCHENG_STORAGE_STATE"] = TONGCHENG_STORAGE_STATE
-        env["TONGCHENG_HEADLESS"] = "1" if self.headless else "0"
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "node", str(script), *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(self.project_dir),
-                env=env,
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout or self.timeout
-                )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.communicate()
-                return {"error": "timeout", "transport": [], "debug": {"error": "timeout"}}
-            output = (
-                stdout.decode("utf-8", errors="replace").strip()
-                or stderr.decode("utf-8", errors="replace").strip()
-                or "{}"
-            )
-            try:
-                return json.loads(output)
-            except json.JSONDecodeError:
-                return {"raw": output[:500], "error": "invalid_json", "transport": []}
-        except Exception as e:
-            return {"error": str(e), "transport": [], "debug": {"error": str(e)}}
-
-    # ── 解析工具 ──────────────────────────────────────────────────────────────
-
-    def _parse_transport_result(self, from_city: str, to_city: str, raw: dict) -> List[TransportOption]:
-        items = raw.get("transport", [])
-        results: List[TransportOption] = []
-        for item in items:
-            try:
-                mode = item.get("mode", "unknown")
-                price = float(item.get("price", 999999))
-                duration_min = int(item.get("duration_min", 99999))
-                comfort_score = float(item.get("comfort_score", 0.5))
-                transfer_count = int(item.get("transfer_count", 0))
-                if price <= 0 or duration_min <= 0:
-                    continue
-                results.append(TransportOption(
-                    from_city=from_city,
-                    to_city=to_city,
-                    mode=mode,
-                    price=price,
-                    duration_min=duration_min,
-                    comfort_score=comfort_score,
-                    transfer_count=transfer_count,
-                ))
-            except Exception:
-                continue
-        results.sort(key=lambda x: (x.price, x.duration_min))
-        return results[:8]
-
     def _parsed_dicts_to_options(
         self, from_city: str, to_city: str, items: List[dict]
     ) -> List[TransportOption]:
@@ -426,16 +249,3 @@ class TongchengProvider(BaseTravelProvider):
             except Exception:
                 continue
         return results[:8]
-
-    def _parse_hotel_cost(self, raw: dict) -> float:
-        hotels = raw.get("hotels", [])
-        prices = []
-        for item in hotels:
-            try:
-                prices.append(float(item.get("price", 0)))
-            except Exception:
-                pass
-        if prices:
-            prices.sort()
-            return prices[min(len(prices) // 2, len(prices) - 1)]
-        return 260.0
