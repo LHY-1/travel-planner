@@ -1,0 +1,43 @@
+# Python
+.venv/
+venv_win/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Node
+node_modules/
+
+# Runtime data
+runtime_data/
+browser_state/
+*.log
+api_debug*.log
+uvicorn*.log
+err*.log
+out.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+
+# Test files
+test_*.py
+debug_*.py
+*_debug/
+debug_*.json
+
+# Misc
+cloudflared.exe
+cloudflared.msi
+*.bat

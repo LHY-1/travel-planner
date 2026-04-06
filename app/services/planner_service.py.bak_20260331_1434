@@ -1,0 +1,840 @@
+from __future__ import annotations
+
+import asyncio
+from copy import deepcopy
+from datetime import datetime, timedelta
+from itertools import permutations
+
+from app.providers.hybrid_provider import HybridTravelProvider
+from app.schemas.recommend import RecommendRequest, DayDraft
+from app.schemas.request import PlanRequest
+from app.schemas.response import DailyItem, PlanResponse, PlanOption, Segment
+from app.services.recommend_service import RecommendService
+
+
+class PlannerService:
+    def __init__(self):
+        self.provider = HybridTravelProvider()
+        self.recommend_service = RecommendService()
+        self._train_cache: dict[tuple[str, str], dict] = {}
+        self._leg_cache: dict[tuple[str, str, str, str], tuple[dict, str | None]] = {}
+        self.hub_transfer = {
+            "苏州": [
+                {"hub": "上海", "duration_min": 45, "price": 60},
+                {"hub": "南京", "duration_min": 90, "price": 70},
+            ],
+        }
+
+    async def create_plan(self, req: PlanRequest):
+        notices = []
+        provider_name = "混合数据"
+        provider_error = None
+        self._train_cache = {}
+        self._leg_cache = {}
+
+        try:
+            seed = self.recommend_service.recommend_seed(
+                RecommendRequest(
+                    start_city=req.start_city,
+                    end_city=req.end_city,
+                    candidate_cities=req.candidate_cities,
+                    stay_days_by_city=req.stay_days_by_city,
+                    days=req.days,
+                    budget=req.budget,
+                    pace=req.pace,
+                    travel_date=req.travel_date,
+                    weights=req.weights.model_dump(),
+                )
+            )
+            seed, reorder_notices = await self._rerank_seed_with_real_transport(seed, req)
+            notices.extend(reorder_notices)
+            option, local_notices = await self._build_plan_from_seed(seed, req)
+            options = [option]
+            notices.extend(local_notices)
+        except Exception as e:
+            provider_error = str(e)
+            options = [
+                PlanOption(
+                    route=[req.start_city, req.end_city or req.start_city],
+                    total_cost=0,
+                    total_experience=0,
+                    total_time_min=0,
+                    total_score=0,
+                    segments=[],
+                    daily_itinerary=[],
+                    meta={"provider": provider_name, "pace": self._pace_label(req.pace), "strategy": "草案"},
+                )
+            ]
+
+        debug = {
+            "candidate_count": len(req.candidate_cities),
+            "provider": provider_name,
+            "strategies": [o.meta.get("strategy") for o in options],
+            "transport_summary": {
+                "pair_count": len(options[0].segments),
+                "non_empty_pairs": len(options[0].segments),
+                "total_options": len(options[0].segments),
+                "coverage": 1 if options[0].segments else 0,
+            },
+        }
+        if provider_error:
+            debug["provider_error"] = provider_error
+            notices.append("规划生成中有部分步骤失败，当前先返回可展示骨架。")
+        return PlanResponse(options=options, debug=debug, notices=notices)
+
+    async def _rerank_seed_with_real_transport(self, seed, req: PlanRequest):
+        stops = list(seed.stops)
+        if len(stops) <= 1:
+            return seed, []
+
+        original_order = [s.city for s in stops]
+        stay_map = {s.city: s.stay_days for s in stops}
+        end_city = req.end_city or req.start_city
+        travel_date = req.travel_date or "2026-04-05"
+        departure_dates = self._date_range(req.departure_date_start or travel_date, req.departure_date_end or travel_date)
+        first_date = departure_dates[0] if departure_dates else travel_date
+
+        key_pairs: set[tuple[str, str]] = set()
+        for city in original_order:
+            key_pairs.add((req.start_city, city))
+            key_pairs.add((city, end_city))
+        for i in range(len(original_order) - 1):
+            key_pairs.add((original_order[i], original_order[i + 1]))
+            key_pairs.add((original_order[i + 1], original_order[i]))
+
+        warmup_tasks = [self._estimate_leg(a, b, first_date, req.pace) for a, b in key_pairs if a != b]
+        if warmup_tasks:
+            await asyncio.gather(*warmup_tasks)
+
+        # 先从全量 stops 开始，如果真实交通下装不进 req.days，就逐步裁掉最后一城
+        candidate_orders = original_order[:]
+        feasibility_notice = None
+        while candidate_orders:
+            perms = list(permutations(candidate_orders, len(candidate_orders)))
+            tasks = [self._route_real_score(list(perm), stay_map, req) for perm in perms]
+            scores = await asyncio.gather(*tasks)
+            best_idx = min(range(len(scores)), key=lambda i: scores[i])
+            best_order = list(perms[best_idx])
+
+            estimated_days = await self._estimate_route_days(best_order, stay_map, req)
+            if estimated_days <= req.days:
+                if best_order != original_order:
+                    stop_map = {s.city: s for s in stops}
+                    new_stops = [stop_map[c] for c in best_order]
+                    seed.stops = new_stops
+                    new_route = [req.start_city] + best_order
+                    if new_route[-1] != end_city:
+                        new_route.append(end_city)
+                    seed.recommended_route = new_route
+                    seed.daily_draft = self._build_daily_draft(new_stops)
+                    notices = ["已根据真实交通估价重新调整城市顺序。"]
+                    if feasibility_notice:
+                        notices.append(feasibility_notice)
+                    return seed, notices
+                notices = []
+                if feasibility_notice:
+                    notices.append(feasibility_notice)
+                return seed, notices
+
+            candidate_orders = candidate_orders[:-1]
+            feasibility_notice = f"按真实交通与出发时段测算，原路线装不进 {req.days} 天，已自动减少 1 个城市。"
+
+        return seed, ["按真实交通测算后路线过密，已保留最小可执行方案。"]
+
+    async def _route_real_score(self, route: list[str], stay_map: dict[str, int], req: PlanRequest) -> float:
+        total = 0.0
+        current = req.start_city
+        travel_date = req.travel_date or "2026-04-05"
+        departure_dates = self._date_range(req.departure_date_start or travel_date, req.departure_date_end or travel_date)
+        base_date = self._parse_date(departure_dates[0] if departure_dates else travel_date)
+
+        legs = []
+        if route:
+            legs.append(("start", current, route[0], departure_dates[0] if departure_dates else travel_date, departure_dates))
+            current = route[0]
+            day_offset = stay_map.get(route[0], 1)
+            for city in route[1:]:
+                leg_date = self._format_date(base_date, day_offset)
+                legs.append(("middle", current, city, leg_date, None))
+                current = city
+                day_offset += stay_map.get(city, 1)
+        else:
+            day_offset = 0
+
+        end_city = req.end_city or req.start_city
+        if current != end_city:
+            fallback_return = self._format_date(base_date, max(day_offset - 1, 0))
+            return_dates = self._date_range(req.return_date_start or fallback_return, req.return_date_end or fallback_return)
+            legs.append(("return", current, end_city, return_dates[0] if return_dates else fallback_return, return_dates))
+
+        for leg_type, from_c, to_c, date, explicit_dates in legs:
+            date_key = "|".join(explicit_dates) if explicit_dates else (date or "")
+            cache_key = (from_c, to_c, date_key, req.pace)
+            if cache_key in self._leg_cache:
+                transport, _ = self._leg_cache[cache_key]
+                transport = deepcopy(transport)
+            else:
+                transit = self.recommend_service._transit_score(from_c, to_c)
+                est_duration = int(transit * 600)
+                est_price = int(transit * 1200)
+                transport = {"mode": "估算", "price": est_price, "duration_min": est_duration}
+            multiplier = 1.1 if leg_type == "return" else 1.0
+            total += self._transport_objective(transport, req) * multiplier
+
+        return total
+
+    async def _estimate_route_days(self, route: list[str], stay_map: dict[str, int], req: PlanRequest) -> int:
+        if not route:
+            return 0
+        total_days = 0
+        travel_date = req.travel_date or "2026-04-05"
+        departure_dates = self._date_range(req.departure_date_start or travel_date, req.departure_date_end or travel_date)
+
+        current = req.start_city
+        for idx, city in enumerate(route):
+            explicit_dates = departure_dates if idx == 0 else None
+            date = departure_dates[0] if idx == 0 and departure_dates else travel_date
+            transport, _ = await self._estimate_leg(current, city, date, req.pace, explicit_dates)
+            total_days += self._transport_day_cost(transport)
+            total_days += max(stay_map.get(city, 1), 1)
+            current = city
+
+        end_city = req.end_city or req.start_city
+        if current != end_city:
+            return_dates = self._date_range(req.return_date_start or travel_date, req.return_date_end or travel_date)
+            return_transport, _ = await self._estimate_leg(current, end_city, return_dates[0] if return_dates else travel_date, req.pace, return_dates)
+            total_days += self._transport_day_cost(return_transport)
+
+        return int(total_days)
+
+    def _transport_day_cost(self, transport: dict | None) -> int:
+        if not transport:
+            return 1
+        duration_min = int(transport.get("duration_min", 0) or 0)
+        depart_min = self._time_to_min(transport.get("depart_time"))
+        arrive_min = self._time_to_min(transport.get("arrive_time"))
+
+        # 早上出发 or 长途 or 晚到，都视作占 1 天主行程
+        if duration_min >= 180:
+            return 1
+        if depart_min != -1 and depart_min <= 11 * 60:
+            return 1
+        if arrive_min != -1 and arrive_min >= 21 * 60:
+            return 1
+        return 1
+
+    def _build_daily_draft(self, stops) -> list[DayDraft]:
+        daily_draft: list[DayDraft] = []
+        day_no = 1
+        for idx, stop in enumerate(stops):
+            for local_day in range(stop.stay_days):
+                action = "抵达并熟悉城市" if local_day == 0 else "城市游玩"
+                if local_day == 0 and idx > 0:
+                    prev_city = stops[idx - 1].city
+                    action = f"从 {prev_city} 前往 {stop.city}"
+                theme = f"{stop.city} 初到体验" if local_day == 0 else f"{stop.city} 深入游玩"
+                daily_draft.append(DayDraft(day=day_no, city=stop.city, theme=theme, action=action))
+                day_no += 1
+        return daily_draft
+
+    def _transport_objective(self, transport: dict, req: PlanRequest) -> float:
+        cost_w = float(req.weights.cost)
+        time_w = float(req.weights.time)
+        fatigue_w = float(req.weights.fatigue)
+        comfort_w = float(req.weights.comfort)
+        price = float(transport.get("price", 9999) or 9999)
+        duration = int(transport.get("duration_min", 9999) or 9999)
+        mode = transport.get("mode", "未查到")
+        score = price * (1.0 + cost_w) + duration * (0.45 + time_w + fatigue_w)
+        if mode == "未查到":
+            score += 5000
+        if mode == "火车" and duration >= 300:
+            score += 260
+        if mode == "火车" and duration >= 600:
+            score += 500
+        if mode == "航班" and int(transport.get("transfer_count", 0) or 0) > 0:
+            score += 40 * int(transport.get("transfer_count", 0) or 0)
+        if mode == "航班" and transport.get("arrive_time") and self._time_to_min(transport.get("arrive_time")) >= 22 * 60:
+            score += 120
+        if mode == "航班" and transport.get("depart_time") and self._time_to_min(transport.get("depart_time")) <= 6 * 60 + 30:
+            score += 160
+        score -= comfort_w * 25
+        return score
+
+    async def _estimate_leg(self, from_city: str, to_city: str, date_str: str | None, pace: str, explicit_dates: list[str] | None = None):
+        date_key = "|".join(explicit_dates) if explicit_dates else (date_str or "")
+        key = (from_city, to_city, date_key, pace)
+        if key in self._leg_cache:
+            return deepcopy(self._leg_cache[key][0]), self._leg_cache[key][1]
+        result = await self._choose_transport(from_city, to_city, date_str, pace, explicit_dates=explicit_dates)
+        self._leg_cache[key] = (deepcopy(result[0]), result[1])
+        return result
+
+    async def _build_plan_from_seed(self, seed, req: PlanRequest):
+        notices: list[str] = []
+        route = [req.start_city] + [stop.city for stop in seed.stops]
+        end_city = req.end_city or req.start_city
+        if route[-1] != end_city:
+            route.append(end_city)
+
+        stay_map = {stop.city: max(int(stop.stay_days), 1) for stop in seed.stops}
+        departure_dates = self._date_range(
+            req.departure_date_start or req.travel_date,
+            req.departure_date_end or req.departure_date_start or req.travel_date,
+        )
+        base_date = self._parse_date(departure_dates[0] if departure_dates else req.travel_date)
+
+        daily_itinerary: list[DailyItem] = []
+        segments: list[Segment] = []
+        total_cost = 0.0
+        total_time_min = 0
+
+        # 1) 准备需要查询的交通 legs
+        legs_to_query: list[tuple[str, str, str, str | None, list[str] | None]] = []
+        day_cursor = 0
+
+        if len(route) >= 2 and route[0] != route[1]:
+            legs_to_query.append(("outbound", route[0], route[1], departure_dates[0] if departure_dates else req.travel_date, departure_dates))
+
+        for i in range(1, len(route) - 2):
+            from_city = route[i]
+            to_city = route[i + 1]
+            depart_date = self._format_date(base_date, day_cursor + max(stay_map.get(from_city, 1) - 1, 0))
+            legs_to_query.append(("transit", from_city, to_city, depart_date, None))
+            day_cursor += stay_map.get(from_city, 1)
+
+        if len(route) >= 2 and route[-2] != route[-1]:
+            fallback_return = self._format_date(base_date, max(req.days - 1, 0))
+            return_dates = self._date_range(
+                req.return_date_start or fallback_return,
+                req.return_date_end or req.return_date_start or fallback_return,
+            )
+            legs_to_query.append(("return", route[-2], route[-1], return_dates[0] if return_dates else fallback_return, return_dates))
+
+        # 2) 并发查询交通
+        leg_tasks = [
+            self._estimate_leg(from_c, to_c, date, req.pace, explicit_dates)
+            for _, from_c, to_c, date, explicit_dates in legs_to_query
+        ]
+        leg_results = await asyncio.gather(*leg_tasks) if leg_tasks else []
+
+        outbound_transport: dict | None = None
+        return_transport: dict | None = None
+        transit_leg_map: dict[tuple[str, str], dict] = {}
+
+        for i, (leg_type, from_c, to_c, _, _) in enumerate(legs_to_query):
+            transport, notice = leg_results[i]
+            if notice:
+                notices.append(notice)
+            if leg_type == "outbound":
+                outbound_transport = transport
+            elif leg_type == "return":
+                return_transport = transport
+            else:
+                transit_leg_map[(from_c, to_c)] = transport
+
+            segments.append(Segment(
+                from_city=from_c,
+                to_city=to_c,
+                mode=self._mode_label(transport.get("mode", "fallback")),
+                price=float(transport.get("price", 0) or 0),
+                duration_min=int(transport.get("duration_min", 0) or 0),
+                score=0,
+            ))
+            total_cost += float(transport.get("price", 0) or 0)
+            total_time_min += int(transport.get("duration_min", 0) or 0)
+
+        if outbound_transport and outbound_transport.get("date"):
+            base_date = self._parse_date(outbound_transport.get("date")) or base_date
+
+        plan_start_date = base_date
+
+        # 3) 用 route + stay_map + legs 重新生成 daily_itinerary
+        current_date = plan_start_date
+        route_cities = route[1:-1] if route[-1] == end_city else route[1:]
+
+        for city_idx, city in enumerate(route_cities):
+            next_city = route_cities[city_idx + 1] if city_idx + 1 < len(route_cities) else None
+            stay_days = max(stay_map.get(city, 1), 1)
+
+            # 首日去程：根据出发/到达时间判断这天还能不能算游玩
+            if city_idx == 0 and outbound_transport is not None:
+                travel_date = current_date.isoformat() if current_date else outbound_transport.get("date")
+                depart_min = self._time_to_min(outbound_transport.get("depart_time"))
+                arrive_min = self._time_to_min(outbound_transport.get("arrive_time"))
+                action = self._build_action(req.start_city, city, outbound_transport)
+                if depart_min != -1 and depart_min <= 11 * 60:
+                    theme = f"{city} 初到体验"
+                elif arrive_min != -1 and arrive_min >= 20 * 60:
+                    theme = f"{city} 抵达休整"
+                else:
+                    theme = f"{city} 初到体验"
+
+                daily_itinerary.append(DailyItem(
+                    day=len(daily_itinerary) + 1,
+                    date=travel_date,
+                    city=city,
+                    action=action,
+                    theme=theme,
+                    transport=outbound_transport,
+                ))
+                if current_date:
+                    current_date = self._parse_date(travel_date) or current_date
+                    current_date = current_date + timedelta(days=1)
+                stay_days -= 1
+
+            # 如果这个城市已经没有剩余停留天，但还有下一城短途交通，单独补一个换城日
+            if stay_days <= 0 and next_city and city != next_city:
+                candidate_transport = transit_leg_map.get((city, next_city))
+                if candidate_transport is not None:
+                    depart_min = self._time_to_min(candidate_transport.get("depart_time"))
+                    arrive_min = self._time_to_min(candidate_transport.get("arrive_time"))
+                    item_date = current_date.isoformat() if current_date else candidate_transport.get("date")
+                    theme = f"前往 {next_city}"
+                    if depart_min != -1 and depart_min <= 11 * 60:
+                        theme = f"从 {city} 前往 {next_city}"
+                    elif arrive_min != -1 and arrive_min >= 21 * 60:
+                        theme = f"前往 {next_city}，抵达休整"
+                    daily_itinerary.append(DailyItem(
+                        day=len(daily_itinerary) + 1,
+                        date=item_date,
+                        city=city,
+                        action=self._build_action(city, next_city, candidate_transport),
+                        theme=theme,
+                        transport=candidate_transport,
+                    ))
+                    if current_date:
+                        current_date = current_date + timedelta(days=1)
+                continue
+
+            # 城市内部停留日
+            for local_day in range(max(stay_days, 0)):
+                is_last_stay_day = (local_day == max(stay_days, 0) - 1)
+                transport = None
+                item_date = current_date.isoformat() if current_date else None
+                action = "城市游玩"
+                theme = f"{city} 深入游玩"
+
+                # 只允许一天一段主交通：离城交通挂在该城市最后一天
+                if is_last_stay_day and next_city and city != next_city:
+                    candidate_transport = transit_leg_map.get((city, next_city))
+                    if candidate_transport is not None:
+                        depart_min = self._time_to_min(candidate_transport.get("depart_time"))
+                        arrive_min = self._time_to_min(candidate_transport.get("arrive_time"))
+                        transport = candidate_transport
+                        item_date = current_date.isoformat() if current_date else (candidate_transport.get("date") or item_date)
+                        action = self._build_action(city, next_city, candidate_transport)
+
+                        if depart_min != -1 and depart_min <= 11 * 60:
+                            theme = f"{city} 出发前往 {next_city}"
+                        elif arrive_min != -1 and arrive_min >= 21 * 60:
+                            theme = f"前往 {next_city}，抵达休整"
+                        else:
+                            theme = f"前往 {next_city}"
+
+                daily_itinerary.append(DailyItem(
+                    day=len(daily_itinerary) + 1,
+                    date=item_date,
+                    city=city,
+                    action=action,
+                    theme=theme,
+                    transport=transport,
+                ))
+                if current_date:
+                    current_date = current_date + timedelta(days=1)
+
+        if return_transport is not None:
+            last_city = route[-2]
+            return_date = current_date.isoformat() if current_date else (return_transport.get("date") or None)
+            depart_min = self._time_to_min(return_transport.get("depart_time"))
+            arrive_min = self._time_to_min(return_transport.get("arrive_time"))
+            return_theme = "返程"
+            if depart_min != -1 and depart_min <= 11 * 60:
+                return_theme = "返程"
+            elif arrive_min != -1 and arrive_min >= 21 * 60:
+                return_theme = "返程，抵达较晚"
+
+            daily_itinerary.append(DailyItem(
+                day=len(daily_itinerary) + 1,
+                date=return_date,
+                city=last_city,
+                action=self._build_action(last_city, end_city, return_transport, is_return=True),
+                theme=return_theme,
+                transport=return_transport,
+            ))
+
+        # 4) 若总天数超限，优先压缩中间无交通的深度游玩日
+        while len(daily_itinerary) > req.days and len(daily_itinerary) > 1:
+            remove_idx = None
+            for i in range(len(daily_itinerary) - 2, 0, -1):
+                item = daily_itinerary[i]
+                if item.transport is None and item.theme and "深入游玩" in item.theme:
+                    remove_idx = i
+                    break
+            if remove_idx is None:
+                break
+            daily_itinerary.pop(remove_idx)
+
+        for idx, item in enumerate(daily_itinerary, start=1):
+            item.day = idx
+
+        total_experience = 70.0 * len(daily_itinerary)
+        total_score = round(total_experience - total_cost * 0.3 - total_time_min * 0.03, 2)
+        return PlanOption(
+            route=route,
+            total_cost=round(total_cost, 2),
+            total_experience=round(total_experience, 2),
+            total_time_min=int(total_time_min),
+            total_score=total_score,
+            segments=segments,
+            daily_itinerary=daily_itinerary,
+            meta={
+                "provider": "混合数据",
+                "pace": self._pace_label(req.pace),
+                "strategy": "按真实交通重建日程",
+                "segment_modes": [s.mode for s in segments],
+            },
+        ), notices
+
+    async def _choose_transport(self, from_city: str, to_city: str, date_str: str | None, pace: str, explicit_dates: list[str] | None = None):
+        """
+        在候选日期范围内并发查询火车 + 航班，选出综合评分最优的日期和方案。
+
+        日期来源优先级：
+          1. explicit_dates（前端传入的 departure_date_start/end 或 return_date_start/end 展开的列表）
+          2. _candidate_dates（基于 date_str 按 pace 生成的 1-3 天候选）
+
+        火车：并发查所有候选日期，跨日期选最优车次（利用 SQLite 缓存，重复日期不重复请求）
+        航班：并发查所有候选日期 × hub 对，跨日期选全局最优
+        """
+        candidate_dates = explicit_dates or self._candidate_dates(date_str, pace)
+        # 最多查 5 天，避免超时
+        candidate_dates = [d for d in candidate_dates if d] [:5]
+        if not candidate_dates:
+            candidate_dates = [date_str] if date_str else [None]
+
+        errors = []
+        transit_score = self.recommend_service._transit_score(from_city, to_city)
+
+        # ── 火车：并发查所有候选日期 ──────────────────────────────────────────
+        best_train: dict | None = None
+        cache_key = (from_city, to_city)
+        cached_train = self._train_cache.get(cache_key)
+        if cached_train:
+            # 缓存命中：直接用，日期更新为候选第一天（时刻表基本不变）
+            best_train = dict(cached_train)
+            best_train["date"] = candidate_dates[0]
+        else:
+            async def _query_train_date(d: str | None):
+                try:
+                    result = await self.provider.train_provider.search_single_train(from_city, to_city, d)
+                    parsed = result.get("parsed", [])
+                    valid = [x for x in parsed if self._is_valid_train(x)]
+                    if valid:
+                        best = min(valid, key=lambda x: self._score_train_candidate(x, pace))
+                        return d, best
+                except Exception:
+                    pass
+                return d, None
+
+            train_results = await asyncio.gather(*[_query_train_date(d) for d in candidate_dates])
+
+            # 跨日期选最优车次
+            best_train_score = float("inf")
+            best_train_date = None
+            best_train_option = None
+            for d, option in train_results:
+                if option is None:
+                    continue
+                score = self._score_train_candidate(option, pace)
+                if score < best_train_score:
+                    best_train_score = score
+                    best_train_date = d
+                    best_train_option = option
+
+            if best_train_option:
+                best_train = {
+                    "mode": "火车",
+                    "from_city": from_city,
+                    "to_city": to_city,
+                    "date": best_train_date,
+                    "price": float(best_train_option.get("price", 0) or 0),
+                    "duration_min": int(best_train_option.get("duration_min", 0) or 0),
+                    "depart_time": best_train_option.get("depart_time"),
+                    "arrive_time": best_train_option.get("arrive_time"),
+                    "duration_text": best_train_option.get("duration_text"),
+                    "train_no": best_train_option.get("train_no"),
+                    "train_type": self._train_type_label(best_train_option.get("train_type")),
+                    "booking_url": (
+                        best_train_option.get("booking_url")
+                        or self.provider.train_provider.build_booking_url(from_city, to_city, best_train_date)
+                    ),
+                    "_score": best_train_score,
+                    "_date_range_searched": len(candidate_dates),
+                }
+                self._train_cache[cache_key] = dict(best_train)
+            else:
+                errors.append(f"{from_city}→{to_city} 火车查询失败（{len(candidate_dates)} 天均无结果）")
+
+        # ── 航班：并发查所有候选日期 × hub 对 ────────────────────────────────
+        best_flight: dict | None = None
+        train_duration = best_train["duration_min"] if best_train else 9999
+        should_query_flight = (
+            best_train is None
+            or train_duration >= 300
+            or (transit_score >= 0.4 and train_duration >= 180)
+        )
+        if should_query_flight:
+            pairs = self._flight_pairs_with_hub(from_city, to_city)
+
+            async def _query_flight_date_pair(d: str | None, pair: dict):
+                try:
+                    result = await self.provider.flight_provider.search_single_flight(
+                        pair["flight_from"], pair["flight_to"], d or ""
+                    )
+                    parsed = result.get("parsed", [])
+                    if parsed:
+                        option = min(parsed, key=lambda x: self._score_flight_candidate(x, pace))
+                        payload = {
+                            "mode": "航班",
+                            "from_city": from_city,
+                            "to_city": to_city,
+                            "date": d,
+                            "price": float(option.get("price", 0) or 0) + pair["extra_price"],
+                            "duration_min": int(option.get("duration_min", 0) or 0) + pair["extra_duration_min"],
+                            "depart_time": option.get("depart_time"),
+                            "arrive_time": option.get("arrive_time"),
+                            "duration_text": option.get("duration_text"),
+                            "flight_no": option.get("flight_no"),
+                            "airline": option.get("airline"),
+                            "transfer_count": int(option.get("transfer_count", 0) or 0),
+                            "booking_url": (
+                                option.get("booking_url")
+                                or self.provider.flight_provider.build_booking_url(
+                                    pair["flight_from"], pair["flight_to"], d
+                                )
+                            ),
+                            "access_path": pair["access_path"],
+                        }
+                        payload["_score"] = self._score_flight_candidate(payload, pace)
+                        return payload
+                except Exception:
+                    pass
+                return None
+
+            flight_tasks = [
+                _query_flight_date_pair(d, pair)
+                for d in candidate_dates
+                for pair in pairs
+            ]
+            flight_results = await asyncio.gather(*flight_tasks)
+
+            # 跨日期 × hub 选全局最优
+            for payload in flight_results:
+                if payload is None:
+                    continue
+                if best_flight is None or payload["_score"] < best_flight["_score"]:
+                    best_flight = payload
+
+            if best_flight is None:
+                errors.append(f"{from_city}→{to_city} 航班查询失败（{len(candidate_dates)} 天均无结果）")
+
+        # ── 选择最优方案 ──────────────────────────────────────────────────────
+        chosen = None
+        if best_train and best_flight:
+            train_is_bad = best_train["duration_min"] >= 300 or best_train["price"] >= best_flight["price"]
+            flight_is_good = (
+                best_flight["duration_min"] + 120 < best_train["duration_min"]
+                or best_flight["price"] <= best_train["price"] * 1.15
+            )
+            train_score = best_train.get("_score", self._score_train_candidate(best_train, pace))
+            flight_score = best_flight.get("_score", self._score_flight_candidate(best_flight, pace))
+            chosen = best_flight if (train_is_bad and flight_is_good) else (
+                best_train if train_score <= flight_score else best_flight
+            )
+        elif best_train:
+            chosen = best_train
+        elif best_flight:
+            chosen = best_flight
+
+        if chosen:
+            # 记录实际搜索了几天（方便前端展示"已比较 N 天"）
+            chosen["_date_range_searched"] = len(candidate_dates)
+            chosen.pop("_score", None)
+            notice = ("；".join(errors) if errors else None)
+            if len(candidate_dates) > 1:
+                notice_prefix = f"已比较 {len(candidate_dates)} 天，选出最优日期 {chosen.get('date', '')}。"
+                notice = (notice_prefix + notice) if notice else notice_prefix
+            return chosen, notice
+
+        fallback = await self.provider.mock_provider.get_transport_matrix([from_city, to_city], date_str)
+        options = fallback.get((from_city, to_city), []) if isinstance(fallback, dict) else []
+        if options:
+            best = sorted(options, key=lambda x: (x.price, x.duration_min))[0]
+            return {
+                "mode": self._mode_label(best.mode),
+                "from_city": from_city,
+                "to_city": to_city,
+                "date": date_str,
+                "price": best.price,
+                "duration_min": best.duration_min,
+                "note": "当前未查到真实票。",
+            }, f"{from_city}→{to_city} 实时查询未命中。"
+        return {
+            "mode": "未查到",
+            "from_city": from_city,
+            "to_city": to_city,
+            "date": date_str,
+            "note": "当前未找到可用交通方案。",
+        }, f"{from_city}→{to_city} 未找到可用交通方案。"
+
+    def _is_valid_train(self, option: dict) -> bool:
+        """过滤掉不合理的火车方案（如夜间卧铺当高铁卖）"""
+        train_no = str(option.get("train_no", "")).upper()
+        duration = int(option.get("duration_min", 0) or 0)
+        train_type = option.get("train_type", "")
+
+        # D 字头时长 >8h 是夜间卧铺，不算高铁
+        if train_no.startswith("D") and duration > 480:
+            return False
+
+        # 普速车 >13h 不推荐
+        if train_type == "normal" and duration > 780:
+            return False
+
+        return True
+
+    def _flight_pairs_with_hub(self, from_city: str, to_city: str):
+        from_options = [{"city": from_city, "extra_duration_min": 0, "extra_price": 0, "label": ""}]
+        to_options = [{"city": to_city, "extra_duration_min": 0, "extra_price": 0, "label": ""}]
+        if from_city in self.hub_transfer:
+            from_options = [{"city": x["hub"], "extra_duration_min": x["duration_min"], "extra_price": x["price"], "label": f"{from_city}→{x['hub']}"} for x in self.hub_transfer[from_city]]
+        if to_city in self.hub_transfer:
+            to_options = [{"city": x["hub"], "extra_duration_min": x["duration_min"], "extra_price": x["price"], "label": f"{x['hub']}→{to_city}"} for x in self.hub_transfer[to_city]]
+        pairs = []
+        for f in from_options:
+            for t in to_options:
+                pairs.append({
+                    "flight_from": f["city"],
+                    "flight_to": t["city"],
+                    "extra_duration_min": f["extra_duration_min"] + t["extra_duration_min"],
+                    "extra_price": f["extra_price"] + t["extra_price"],
+                    "access_path": " + ".join([x for x in [f["label"], t["label"]] if x]),
+                })
+        return pairs
+
+    def _build_action(self, from_city: str, to_city: str, transport: dict, is_return: bool = False) -> str:
+        if transport.get("access_path"):
+            base = f"从 {from_city} 经接驳 {transport['access_path']} 乘{transport.get('mode', '交通')}前往 {to_city}"
+        else:
+            base = f"从 {from_city} 前往 {to_city}"
+        if is_return:
+            return base.replace("前往", "返回")
+        return base
+
+    def _score_train_candidate(self, option: dict, pace: str) -> float:
+        price = float(option.get("price", 10**9) or 10**9)
+        duration = int(option.get("duration_min", 10**9) or 10**9)
+        train_type = option.get("train_type") or "normal"
+
+        # D 字头时长 >6h 不是真正高铁
+        train_no = str(option.get("train_no", "")).upper()
+        if train_no.startswith("D") and duration > 360:
+            train_type = "normal"
+
+        duration_penalty = duration * (0.12 if train_type == "high_speed" else 0.20)
+        type_bias = 0 if train_type == "high_speed" else 90
+
+        # 到达时间惩罚
+        arrive_time = option.get("arrive_time") or ""
+        arrive_min = self._time_to_min(arrive_time)
+        late_penalty = 80 if arrive_min >= 22 * 60 else 0
+
+        # 出发时间惩罚：凌晨 0:00-6:00 出发不合理
+        depart_time = option.get("depart_time") or ""
+        depart_min = self._time_to_min(depart_time)
+        if 0 <= depart_min < 6 * 60:
+            early_penalty = 300
+        elif 6 * 60 <= depart_min < 7 * 60:
+            early_penalty = 60
+        else:
+            early_penalty = 0
+
+        # 夜间动卧（D 字头次日到达）：可接受但降权
+        is_overnight_sleeper = (
+            train_no.startswith("D") and
+            (option.get("arrival_day") or "").startswith("次日")
+        )
+        sleeper_penalty = 120 if is_overnight_sleeper else 0
+
+        price_weight = 0.9 if pace == "budget" else 1.0
+        if duration >= 300:
+            duration_penalty += 220
+        if duration >= 600:
+            duration_penalty += 400
+        return price * price_weight + duration_penalty + type_bias + late_penalty + early_penalty + sleeper_penalty
+
+    def _score_flight_candidate(self, option: dict, pace: str) -> float:
+        price = float(option.get("price", 10**9) or 10**9)
+        duration = int(option.get("duration_min", 10**9) or 10**9)
+        transfer_count = int(option.get("transfer_count", 0) or 0)
+        depart_penalty = 160 if option.get("depart_time") and self._time_to_min(option.get("depart_time")) <= 6 * 60 + 30 else 0
+        arrive_penalty = 120 if option.get("arrive_time") and self._time_to_min(option.get("arrive_time")) >= 22 * 60 else 0
+        price_weight = 0.95 if pace == "budget" else 1.0
+        return price * price_weight + duration * 0.11 + transfer_count * 35 + depart_penalty + arrive_penalty
+
+    def _date_range(self, start_str: str | None, end_str: str | None):
+        start = self._parse_date(start_str)
+        end = self._parse_date(end_str)
+        if start and end and end >= start:
+            days = (end - start).days
+            return [(start + timedelta(days=i)).isoformat() for i in range(min(days + 1, 7))]
+        if start:
+            return [start.isoformat()]
+        if end:
+            return [end.isoformat()]
+        return []
+
+    def _candidate_dates(self, date_str: str | None, pace: str):
+        if not date_str:
+            return [None]
+        base = self._parse_date(date_str)
+        if not base:
+            return [date_str]
+        offsets = (0, 1, 2) if pace == "budget" else (0, 1)
+        return [(base + timedelta(days=offset)).isoformat() for offset in offsets]
+
+    def _is_long_edge(self, from_city: str, to_city: str) -> bool:
+        transit = self.recommend_service._transit_score(from_city, to_city)
+        return transit >= 0.55
+
+    def _parse_date(self, value: str | None):
+        if not value:
+            return None
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+    def _format_date(self, base_date, offset: int):
+        if not base_date:
+            return None
+        return (base_date + timedelta(days=offset)).isoformat()
+
+    def _time_to_min(self, value: str | None) -> int:
+        if not value or ":" not in value:
+            return -1
+        try:
+            hh, mm = value.split(":", 1)
+            return int(hh) * 60 + int(mm)
+        except Exception:
+            return -1
+
+    def _mode_label(self, mode: str) -> str:
+        return {"train": "火车", "flight": "航班", "fallback": "未查到", "bus": "大巴"}.get(mode, mode)
+
+    def _pace_label(self, pace: str) -> str:
+        return {"balanced": "均衡", "budget": "省钱优先", "relaxed": "休闲"}.get(pace, pace)
+
+    def _train_type_label(self, train_type: str | None) -> str:
+        return {"high_speed": "高铁/动车", "normal": "普速"}.get(train_type or "", train_type or "")

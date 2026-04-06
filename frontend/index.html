@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>旅行规划助手</title>
+  <style>
+    :root{--bg:#0b1020;--bg2:#111936;--panel:rgba(18,25,51,.96);--line:rgba(255,255,255,.08);--text:#eef3ff;--muted:#9fb0d3;--accent:#6ea8fe;--warn:#ffd166;--radius:20px}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:Inter,PingFang SC,Microsoft YaHei,Arial,sans-serif;color:var(--text);background:radial-gradient(circle at top right,rgba(110,168,254,.12),transparent 24%),linear-gradient(180deg,var(--bg) 0%,var(--bg2) 100%);min-height:100vh}
+    .page{max-width:1360px;margin:0 auto;padding:28px}
+    .hero{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:24px}
+    .hero h1{margin:0 0 10px;font-size:34px}
+    .hero p{margin:0;color:var(--muted);line-height:1.6;max-width:760px}
+    .pill{padding:10px 14px;border-radius:999px;background:rgba(110,168,254,.12);border:1px solid rgba(110,168,254,.22);font-size:13px}
+    .layout{display:grid;grid-template-columns:400px 1fr;gap:20px}
+    .panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+    .hd{padding:18px 20px;border-bottom:1px solid var(--line)}
+    .bd{padding:20px}
+    .section-title{margin:0;font-size:17px;font-weight:700}
+    .section-sub{margin-top:6px;font-size:13px;color:var(--muted)}
+    .grid-2,.grid-3,.stats,.actions,.segment-meta,.input-grid{display:grid;gap:12px}
+    .grid-2{grid-template-columns:1fr 1fr}.grid-3{grid-template-columns:repeat(3,1fr)}
+    .stats{grid-template-columns:repeat(4,1fr);margin-bottom:16px}
+    .actions{grid-template-columns:1fr 1fr;margin-top:16px}
+    .segment-meta{grid-template-columns:repeat(5,1fr)}
+    .stack{display:flex;flex-direction:column;gap:16px}
+    label{display:block;margin-bottom:6px;font-size:12px;color:var(--muted)}
+    input,textarea,select,button{width:100%;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text);border-radius:12px;padding:12px 14px;font-size:14px}
+    textarea{min-height:90px;resize:vertical}
+    button{cursor:pointer;font-weight:700;background:linear-gradient(135deg,var(--accent),#4f7dff);border:none;color:#fff;border-radius:12px;padding:13px}
+    button.secondary{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:var(--text)}
+    .stat,.card,.summary-item,.segment-card{background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:16px}
+    .stat{padding:16px}
+    .k,.mini{font-size:12px;color:var(--muted);line-height:1.5}
+    .v{font-size:22px;font-weight:700;margin-top:8px}
+    .notice{border-left:4px solid var(--warn);background:rgba(255,209,102,.08);padding:12px 14px;border-radius:12px;color:#ffe8a3;line-height:1.6;margin-bottom:8px}
+    .notice.notice-info{border-left-color:#7ef0c5;background:rgba(126,240,197,.07);color:#a8f5d8}
+    .tags{display:flex;gap:8px;flex-wrap:wrap}
+    .tag{font-size:12px;padding:5px 10px;border-radius:999px;background:rgba(126,240,197,.12);border:1px solid rgba(126,240,197,.2);color:#7ef0c5}
+    .tag.soft{background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.1);color:var(--muted)}
+    .tag.warn{background:rgba(255,209,102,.12);border-color:rgba(255,209,102,.2);color:#ffd166}
+    .tag-realtime{background:rgba(126,240,197,.15);border-color:rgba(126,240,197,.3);color:#7ef0c5}
+    .tag-cache{background:rgba(110,168,254,.15);border-color:rgba(110,168,254,.3);color:#6ea8fe}
+    .tag-estimate{background:rgba(255,209,102,.15);border-color:rgba(255,209,102,.3);color:#ffd166}
+    .card{padding:18px}
+    .top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+    .route{font-size:20px;font-weight:800;line-height:1.45}
+    .summary{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:12px 0 16px}
+    .summary-item{padding:12px}
+    .summary-item small{display:block;color:var(--muted);margin-bottom:6px;font-size:11px}
+    .summary-item strong{font-size:18px}
+    .segment-list{display:flex;flex-direction:column;gap:12px;margin:0;padding:0;list-style:none}
+    .segment-card{padding:14px}
+    .segment-header{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+    .segment-title{font-size:15px;font-weight:700}
+    .segment-meta div{background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:10px}
+    .section-divider{margin:12px 0 8px}
+    .divider-label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;padding:4px 0;border-bottom:1px solid var(--line);margin-bottom:10px}
+    .transport-card{background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:14px;padding:14px 16px;display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:8px}
+    .transport-header{display:flex;align-items:center;gap:12px;min-width:200px}
+    .transport-route{font-size:15px;font-weight:700}
+    .transport-body{display:flex;gap:24px;align-items:center;flex-wrap:wrap}
+    .transport-time{font-size:14px;color:var(--muted);min-width:120px}
+    .transport-meta{display:flex;gap:20px;font-size:14px;color:var(--muted)}
+    .book-link{color:var(--accent);text-decoration:none;font-size:13px}
+    .day-card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:14px 18px;margin-bottom:12px;display:block}
+    .day-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+    .day-num{font-weight:700;color:var(--accent);font-size:15px}
+    .day-date{color:var(--muted);font-size:13px}
+    .day-activity{font-size:14px;color:var(--text)}
+    .itinerary-list{display:flex;flex-direction:column;gap:0;margin-top:12px}
+    .transport-row{display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(110,168,254,.06);border:1px solid rgba(110,168,254,.18);border-radius:12px;margin:6px 0;font-size:13px;flex-wrap:wrap}
+    .tr-icon{font-size:16px;flex-shrink:0}
+    .tr-route{font-weight:700;font-size:14px;color:var(--text);flex-shrink:0}
+    .tr-no{color:var(--muted);font-size:12px;background:rgba(255,255,255,.06);padding:2px 8px;border-radius:6px}
+    .tr-time{color:var(--accent);font-size:13px}
+    .tr-dur{color:var(--muted);font-size:12px}
+    .tr-price{font-weight:700;color:#7ef0c5}
+    .tr-book{margin-left:auto}
+    .transport-access{font-size:12px;color:var(--warn);background:rgba(255,209,102,.08);padding:2px 8px;border-radius:6px}
+    .day-row{display:flex;align-items:center;gap:14px;padding:10px 14px;border-bottom:1px solid var(--line);font-size:13px}
+    .day-row:last-child{border-bottom:none}
+    .day-row.day-arrive{background:rgba(126,240,197,.04)}
+    .day-row.day-depart{background:rgba(255,209,102,.04)}
+    .dr-num{color:var(--muted);font-size:12px;min-width:60px;flex-shrink:0}
+    .dr-date{color:var(--muted);font-size:12px;min-width:80px;flex-shrink:0}
+    .dr-city{font-weight:700;font-size:15px;min-width:60px;flex-shrink:0}
+    .dr-theme{color:var(--muted);font-size:13px}
+    .dr-muted{color:var(--muted);font-size:12px;font-style:italic}
+    .empty{padding:28px;text-align:center;color:var(--muted);border:1px dashed rgba(255,255,255,.18);border-radius:16px;background:rgba(255,255,255,.02);line-height:1.7}
+    .input-date{border-left:4px solid var(--accent);cursor:pointer}
+    .transport-box{background:rgba(110,168,254,.08);border-radius:8px;padding:10px 14px;margin-bottom:8px}
+    .transport-route-title{font-weight:700;font-size:15px;margin-bottom:6px;color:var(--text)}
+    .transport-station{font-size:12px;color:var(--muted);margin-bottom:6px}
+    .trans-group{margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.08)}
+    .trans-group:first-child{border-top:none;margin-top:0;padding-top:0}
+    .trans-group-label{font-size:12px;color:var(--accent);margin-bottom:4px;font-weight:600}
+    .trans-group-items{display:flex;flex-wrap:wrap;gap:6px}
+    .trans-opt{display:inline-flex;align-items:center;gap:4px;padding:4px 8px;background:rgba(255,255,255,.04);border-radius:6px;font-size:12px;cursor:pointer;border:1px solid transparent}
+    .trans-opt:hover{background:rgba(255,255,255,.08);border-color:var(--accent)}
+    .trans-opt.current-opt{background:rgba(110,168,254,.15);border-color:var(--accent)}
+    .opt-icon{font-size:14px}
+    .opt-type{color:var(--muted);font-size:11px}
+    .opt-no{font-weight:600;color:var(--text)}
+    .opt-time{color:var(--muted)}
+    .opt-price{color:var(--warn);font-weight:600}
+    .timeline{margin-top:10px;padding:8px 12px;background:rgba(255,255,255,.03);border-radius:6px;font-size:12px}
+    .timeline-item{display:flex;align-items:center;gap:8px;padding:4px 0}
+    .tl-time{color:var(--accent);min-width:50px;font-weight:600}
+    .tl-icon{min-width:20px}
+    .tl-event{flex:1;color:var(--text)}
+    .tl-dur{color:var(--muted);font-size:11px}
+    .tag-realtime{background:rgba(110,168,254,.2);color:var(--accent);padding:2px 6px;border-radius:4px;font-size:11px}
+    .theme-switch{position:fixed;top:20px;right:20px;z-index:100}
+.modal{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);display:flex;justify-content:center;align-items:center;z-index:1000}
+.modal-content{background:var(--panel);border:1px solid var(--line);border-radius:16px;max-width:500px;width:90%;max-height:80vh;overflow-y:auto}
+.modal-header{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--line)}
+.modal-title{font-weight:700;font-size:16px}
+.modal-close{cursor:pointer;font-size:24px;color:var(--muted)}
+.modal-close:hover{color:var(--text)}
+.modal-body{padding:16px 20px}
+.version-item{margin-bottom:20px}
+.version-num{font-weight:700;color:var(--accent);font-size:14px}
+.version-date{color:var(--muted);font-size:12px;margin-bottom:8px}
+.version-list{margin:0;padding-left:20px;font-size:13px;line-height:1.8}
+.version-list li{margin-bottom:4px}
+    .theme-switch button{width:40px;height:40px;border-radius:50%;border:1px solid var(--line);background:var(--panel);color:var(--text);font-size:18px;cursor:pointer;transition:all 0.2s}
+    .theme-switch button:hover{background:var(--accent);color:#fff}
+    .version{position:fixed;bottom:12px;right:16px;font-size:11px;color:var(--muted);opacity:0.5}
+    @media(max-width:1080px){.layout{grid-template-columns:1fr}.grid-3,.stats,.summary,.segment-meta{grid-template-columns:repeat(2,1fr)}}
+    @media(max-width:700px){.page{padding:16px}.hero{flex-direction:column}.grid-2,.grid-3,.stats,.summary,.actions,.segment-meta,.input-grid{grid-template-columns:1fr}.top,.segment-header{flex-direction:column;align-items:flex-start}}
+  </style>
+</head>
+<body>
+<div class="page">
+  <div class="hero">
+    <div>
+      <h1>旅行规划助手</h1>
+      <p>多城市旅行规划，智能路线与交通规划</p>
+    </div>
+    <div class="pill">旅行</div>
+    <div class="theme-switch">
+      <button id="themeBtn" onclick="cycleTheme()" title="主题">D</button>
+    </div>
+  </div>
+
+  <div class="layout">
+    <div class="panel">
+      <div class="hd">
+        <h2 class="section-title">输入</h2>
+        <div class="section-sub">先生成草案，编辑停留天数，再生成交通规划</div>
+      </div>
+      <div class="bd">
+        <div class="stack">
+          <div class="input-grid">
+            <div>
+              <label>出发地</label>
+              <input id="start_city" value="北京">
+            </div>
+            <div>
+              <label>目的地</label>
+              <input id="end_city" value="北京">
+            </div>
+          </div>
+          <div class="grid-3">
+            <div><label>天数</label><input id="days" type="number" value="5"></div>
+            <div><label>预算</label><input id="budget" type="number" value="3000"></div>
+            <div><label>日期</label><input id="travel_date" type="date" value="2026-04-05"></div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;padding:8px 0">
+            <input type="checkbox" id="overnight_depart" style="width:18px;height:18px;cursor:pointer">
+            <label for="overnight_depart" style="margin:0;cursor:pointer;font-size:13px;color:var(--muted)">允许过夜出发</label>
+          </div>
+          <div class="input-grid">
+            <div>
+              <label>出发时间范围</label>
+              <input id="departure_date_display" class="input-date" value="" placeholder="点击选择" readonly onclick="toggleDatePicker('departure')">
+            </div>
+            <div>
+              <label>返回时间范围</label>
+              <input id="return_date_display" class="input-date" value="" placeholder="点击选择" readonly onclick="toggleDatePicker('return')">
+            </div>
+          </div>
+          <div id="departure_picker" class="card" style="display:none">
+            <div class="mini">最早 - 最晚出发</div>
+            <div class="input-grid" style="margin-top:10px">
+              <div><label>最早</label><input id="departure_date_start" type="date" value="2026-04-05"></div>
+              <div><label>最晚</label><input id="departure_date_end" type="date" value="2026-04-07"></div>
+            </div>
+          </div>
+          <div id="return_picker" class="card" style="display:none">
+            <div class="mini">最晚返回</div>
+            <div class="input-grid" style="margin-top:10px">
+              <div><label>最晚</label><input id="return_date_start" type="date" value=""></div>
+              <div><label>最早</label><input id="return_date_end" type="date" value=""></div>
+            </div>
+          </div>
+          <div>
+            <label>节奏</label>
+            <select id="pace" onchange="applyPacePreset()">
+              <option value="balanced">平衡</option>
+              <option value="budget">省钱</option>
+              <option value="relaxed">休闲</option>
+            </select>
+          </div>
+          <div>
+            <label>城市（逗号分隔）</label>
+            <textarea id="candidate_cities">上海,南京,西安</textarea>
+          </div>
+          <div class="grid-3">
+            <div><label>费用权重</label><input id="w_cost" type="number" step="0.01" value="0.4"></div>
+            <div><label>体验权重</label><input id="w_experience" type="number" step="0.01" value="0.35"></div>
+            <div><label>时间权重</label><input id="w_time" type="number" step="0.01" value="0.1"></div>
+          </div>
+          <div class="input-grid">
+            <div><label>疲劳度</label><input id="w_fatigue" type="number" step="0.01" value="0.1"></div>
+            <div><label>舒适度</label><input id="w_comfort" type="number" step="0.01" value="0.05"></div>
+          </div>
+          <div class="actions">
+            <button onclick="runRecommendSeed()">1. 生成草案</button>
+            <button class="secondary" onclick="runPlan()">2. 生成交通规划</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="hd">
+        <h2 class="section-title">结果</h2>
+        <div class="section-sub">先生成草案，编辑天数，再生成交通规划</div>
+      </div>
+      <div class="bd">
+        <div class="stats" id="stats"></div>
+        <div id="notices" class="stack"></div>
+        <div id="seedResult"><div class="empty">填写参数，点击生成草案，再生成交通规划</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="version" onclick="showChangelog()" title="更新日志">v1.3.7</div>
+<div id="changelogModal" class="modal" style="display:none">
+  <div class="modal-content">
+    <div class="modal-header">
+      <span class="modal-title">更新日志</span>
+      <span class="modal-close" onclick="closeChangelog()">x</span>
+    </div>
+    <div class="modal-body">
+      <div class="version-item">
+        <div class="version-num">v1.3.7 (20260405-1630)</div>
+        <div class="version-date">2026-04-05</div>
+        <ul class="version-list">
+          <li>恢复中文界面</li>
+        </ul>
+      </div>
+      <div class="version-item">
+        <div class="version-num">v1.3.6 (20260404-1730)</div>
+        <div class="version-date">2026-04-04</div>
+        <ul class="version-list">
+          <li>修复编码问题</li>
+          <li>临时切换为英文以避免编码错误</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+var themes = ['dark', 'light', 'auto'];
+var themeLabels = { dark: 'D', light: 'L', auto: 'A' };
+
+function applyTheme(theme) {
+  var root = document.documentElement;
+  var actualTheme = theme;
+  if (theme === 'auto') {
+    var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    actualTheme = prefersDark ? 'dark' : 'light';
+  }
+  if (actualTheme === 'light') {
+    root.style.setProperty('--bg', '#f8fafc');
+    root.style.setProperty('--bg2', '#f1f5f9');
+    root.style.setProperty('--panel', 'rgba(255,255,255,0.98)');
+    root.style.setProperty('--line', 'rgba(0,0,0,0.1)');
+    root.style.setProperty('--text', '#0f172a');
+    root.style.setProperty('--muted', '#334155');
+    root.style.setProperty('--accent', '#2563eb');
+    root.style.setProperty('--warn', '#ea580c');
+    document.body.style.background = 'linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%)';
+  } else {
+    root.style.setProperty('--bg', '#0b1020');
+    root.style.setProperty('--bg2', '#111936');
+    root.style.setProperty('--panel', 'rgba(18,25,51,0.96)');
+    root.style.setProperty('--line', 'rgba(255,255,255,0.08)');
+    root.style.setProperty('--text', '#eef3ff');
+    root.style.setProperty('--muted', '#9fb0d3');
+    root.style.setProperty('--accent', '#6ea8fe');
+    root.style.setProperty('--warn', '#ffd166');
+    document.body.style.background = 'radial-gradient(circle at top right, rgba(110,168,254,0.12), transparent 24%), linear-gradient(180deg, #0b1020 0%, #111936 100%)';
+  }
+  document.getElementById('themeBtn').textContent = themeLabels[theme] || 'D';
+}
+
+function cycleTheme() {
+  var current = localStorage.getItem('theme') || 'dark';
+  var idx = themes.indexOf(current);
+  idx = (idx + 1) % themes.length;
+  var next = themes[idx];
+  localStorage.setItem('theme', next);
+  applyTheme(next);
+}
+
+applyTheme(localStorage.getItem('theme') || 'dark');
+
+function showChangelog() {
+  document.getElementById('changelogModal').style.display = 'flex';
+}
+function closeChangelog() {
+  document.getElementById('changelogModal').style.display = 'none';
+}
+window.onclick = function(event) {
+  var modal = document.getElementById('changelogModal');
+  if (event.target == modal) closeChangelog();
+}
+
+function toggleDatePicker(type) {
+  var picker = document.getElementById(type + '_picker');
+  if (picker.style.display === 'none') {
+    picker.style.display = 'block';
+  } else {
+    picker.style.display = 'none';
+  }
+}
+
+function applyPacePreset() {
+  var pace = document.getElementById('pace').value;
+  if (pace === 'budget') {
+    document.getElementById('w_cost').value = '0.6';
+    document.getElementById('w_experience').value = '0.2';
+    document.getElementById('w_time').value = '0.1';
+    document.getElementById('w_fatigue').value = '0.1';
+    document.getElementById('w_comfort').value = '0.0';
+  } else if (pace === 'relaxed') {
+    document.getElementById('w_cost').value = '0.2';
+    document.getElementById('w_experience').value = '0.4';
+    document.getElementById('w_time').value = '0.2';
+    document.getElementById('w_fatigue').value = '0.1';
+    document.getElementById('w_comfort').value = '0.1';
+  } else {
+    document.getElementById('w_cost').value = '0.4';
+    document.getElementById('w_experience').value = '0.35';
+    document.getElementById('w_time').value = '0.1';
+    document.getElementById('w_fatigue').value = '0.1';
+    document.getElementById('w_comfort').value = '0.05';
+  }
+}
+</script>
+
+<script src="/static/fix_renderplan.js?v=20260405-1715"></script>
+</body>
+</html>
