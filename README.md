@@ -1,6 +1,6 @@
 # Travel Planner
 
-当前版本: v1.4.4
+当前版本: v1.4.7
 
 版本规则:
 - 当前版本号写在 `VERSION`

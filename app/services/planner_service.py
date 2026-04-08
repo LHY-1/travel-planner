@@ -448,8 +448,40 @@ class PlannerService:
                 # 是否是返程日（最后城市的最后一天）
                 is_return_day = is_last_day and is_last_city
 
+                # 单日中转城市：同一天既抵达又出发，优先展示真正发生的出发/返程交通
+                if local_day == 0 and days_in_city == 1 and city_idx > 0 and is_return_day and outbound_t:
+                    transport = outbound_t
+                    try:
+                        depart_hour = int(outbound_t.get("depart_time", "12:00").split(":")[0])
+                    except:
+                        depart_hour = 12
+                    if depart_hour >= 18:
+                        theme = "游玩后返程"
+                    elif depart_hour >= 12:
+                        theme = "下午返程"
+                    else:
+                        theme = "返程"
+                    action = f"返回 {req.start_city}"
+
+                elif local_day == 0 and days_in_city == 1 and city_idx > 0 and is_depart_day and outbound_t:
+                    next_city = route_cities[city_idx + 1]
+                    transport = outbound_t
+                    try:
+                        depart_hour = int(outbound_t.get("depart_time", "18:00").split(":")[0])
+                    except:
+                        depart_hour = 18
+                    if depart_hour >= 20:
+                        theme = "深夜出发"
+                    elif depart_hour >= 18:
+                        theme = "晚上出发"
+                    elif depart_hour >= 12:
+                        theme = "下午出发"
+                    else:
+                        theme = "早上出发"
+                    action = f"前往 {next_city}"
+
                 # 第1天：抵达（非第一个城市不显示交通，交通在前一个城市的出发日已显示）
-                if local_day == 0:
+                elif local_day == 0:
                     if city_idx == 0 and inbound_t:  # 第一个城市：显示出发地到这里的交通
                         transport = inbound_t
                         try:
@@ -505,15 +537,11 @@ class PlannerService:
                 # 普通游玩日：不显示时间线（用户觉得啰嗦）
                 timeline = []
 
-                # transport_options：第一个城市抵达日显示抵达选项，出发日/返程日显示出发选项
+                # transport_options：只给实际展示交通的那一天
                 day_opts = []
-                if local_day == 0 and city_idx == 0 and inbound_opts:
+                if transport == inbound_t and inbound_opts:
                     day_opts = inbound_opts
-                elif (is_depart_day or is_return_day) and outbound_opts:
-                    day_opts = outbound_opts
-                if local_day == 0 and inbound_opts:
-                    day_opts = inbound_opts
-                elif is_depart_day and outbound_opts:
+                elif transport == outbound_t and outbound_opts:
                     day_opts = outbound_opts
 
                 daily_itinerary.append(DailyItem(

@@ -239,7 +239,7 @@
   </div>
 </div>
 
-<div class="version" onclick="showChangelog()" title="更新日志">v1.4.4</div>
+<div class="version" onclick="showChangelog()" title="更新日志">v1.4.7</div>
 <div id="changelogModal" class="modal" style="display:none">
   <div class="modal-content">
     <div class="modal-header">
@@ -247,6 +247,33 @@
       <span class="modal-close" onclick="closeChangelog()">x</span>
     </div>
     <div class="modal-body">
+      <div class="version-item">
+        <div class="version-num">v1.4.7 (20260409-0002)</div>
+        <div class="version-date">2026-04-09</div>
+        <ul class="version-list">
+          <li>补充芜湖 / 芜湖北铁路站点编码</li>
+          <li>修复南京到芜湖、芜湖到苏州等车次查询失败</li>
+          <li>这类行程不再只剩抵达，会正常出现铁路候选</li>
+        </ul>
+      </div>
+      <div class="version-item">
+        <div class="version-num">v1.4.6 (20260408-2349)</div>
+        <div class="version-date">2026-04-08</div>
+        <ul class="version-list">
+          <li>修复单日中转城市只显示抵达、不显示出发交通的问题</li>
+          <li>单日城市优先展示当天实际发生的出发或返程交通</li>
+          <li>继续保留仅在真实交通日展示交通候选</li>
+        </ul>
+      </div>
+      <div class="version-item">
+        <div class="version-num">v1.4.5 (20260408-2344)</div>
+        <div class="version-date">2026-04-08</div>
+        <ul class="version-list">
+          <li>修复行程天与交通候选串位，避免地点和交通对不上</li>
+          <li>仅在真实交通日展示交通候选</li>
+          <li>前端不再用候选列表首项冒充当天已选交通</li>
+        </ul>
+      </div>
       <div class="version-item">
         <div class="version-num">v1.4.4 (20260408-2158)</div>
         <div class="version-date">2026-04-08</div>
@@ -370,6 +397,6 @@ function applyPacePreset() {
 }
 </script>
 
-<script src="/static/fix_renderplan.js?v=20260408-2158"></script>
+<script src="/static/fix_renderplan.js?v=20260408-2344"></script>
 </body>
 </html>

@@ -1,5 +1,5 @@
-// Version: 20260408-2158
-console.log('fix_renderplan.js loaded - version 20260408-2158');
+// Version: 20260408-2344
+console.log('fix_renderplan.js loaded - version 20260408-2344');
 
 const API = window.location.origin;
 let currentPlanData = null;
@@ -262,7 +262,7 @@ function renderPlanResult(data) {
     if (day.theme) html += ' <span class="tag" style="font-size:11px;padding:1px 6px">' + day.theme + '</span>';
     html += '</div>';
 
-    const selectedTransport = day.transport || ((day.transport_options && day.transport_options.length > 0) ? day.transport_options[0] : null);
+    const selectedTransport = day.transport || null;
     if (selectedTransport) {
       const t = selectedTransport;
       const icon = getTransportIcon(t.mode || 'train');
