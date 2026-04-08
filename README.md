@@ -1,5 +1,12 @@
 # Travel Planner
 
+当前版本: v1.4.4
+
+版本规则:
+- 当前版本号写在 `VERSION`
+- 更新说明追加写入 `CHANGELOG.md`
+- 保留历史记录，不删除旧版本说明
+
 智能旅行规划助手 - API-only 版本
 
 ## 部署到 Railway

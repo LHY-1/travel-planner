@@ -1,289 +1,274 @@
 from __future__ import annotations
 
-import asyncio
-import json
-import subprocess
-from pathlib import Path
-from subprocess import TimeoutExpired
+import time
 from typing import List, Optional
 from urllib.parse import quote
 
-from app.config.settings import BASE_DIR
+import httpx
+
 from app.schemas.domain import TransportOption
 
 
 class TrainProvider:
+    STATION_CODES = {
+        "北京": "BJP", "北京南": "VNP", "北京西": "BXP", "北京北": "VAP", "北京丰台": "FTP",
+        "南京": "NJH", "南京南": "NKH", "南京东": "NFH",
+        "上海": "SHH", "上海虹桥": "AOH", "上海南": "SNH", "上海西": "SXH",
+        "西安": "XAY", "西安北": "EAY",
+        "杭州": "HZH", "杭州东": "HGH",
+        "苏州": "SZH", "苏州北": "OHH",
+        "广州": "GZQ", "广州南": "IZQ",
+        "深圳": "SZQ", "深圳北": "IOQ",
+    }
+
+    SEAT_CLASS_MAP = {
+        "9": "商务座",
+        "P": "特等座",
+        "M": "一等座",
+        "O": "二等座",
+        "W": "无座",
+        "D": "优选一等座",
+        "F": "动卧",
+        "I": "高级软卧",
+        "J": "软卧",
+        "4": "软卧",
+        "3": "硬卧",
+        "1": "硬座",
+    }
+
     def __init__(self, timeout: float = 35.0):
         self.timeout = timeout
-        self.project_dir = Path(BASE_DIR)
-        self.script_path = self.project_dir / "scripts" / "search_12306_train.js"
 
     async def search_single_train(self, from_city: str, to_city: str, travel_date: Optional[str] = None) -> dict:
-        # 先查缓存
         from app.services.train_cache import get_cached, set_cached
-        cached = get_cached(from_city, to_city, travel_date or "")
+
+        date = travel_date or ""
+        cached = get_cached(from_city, to_city, date)
         if cached:
             return cached
 
-        # 缓存未命中，查询真实数据
-        raw = await self._run_node_script_async([from_city, to_city, travel_date or ""], timeout=45.0)
-        parsed = self._parse_results(raw.get("results", []), from_city, to_city, travel_date)
-        notices = []
-        if raw.get("notes"):
-            notices.extend(raw.get("notes", []))
-        if not parsed:
-            notices.append("当前没有抓到可展示的 12306 结果，可能是映射未补全、页面结构变化或被站点拦截。")
-
+        raw = await self._search_tongcheng_api(from_city, to_city, date)
+        parsed = self._parse_results(raw.get("trains", []), from_city, to_city, date)
         result = {
             "query": {
                 "from_city": from_city,
                 "to_city": to_city,
-                "travel_date": travel_date,
+                "travel_date": date,
             },
             "raw": raw,
             "parsed": parsed,
             "count": len(parsed),
-            "notices": notices,
-            "booking_url": self.build_booking_url(from_city, to_city, travel_date or ""),
+            "notices": raw.get("notices", []),
+            "booking_url": self.build_booking_url(from_city, to_city, date),
         }
-
-        # 只缓存有结果的数据，避免一次失败把空结果锁死好几天
         if parsed:
-            set_cached(from_city, to_city, travel_date or "", result)
+            set_cached(from_city, to_city, date, result)
         return result
 
     def load_transport_options(self, from_city: str, to_city: str, travel_date: Optional[str] = None) -> List[TransportOption]:
-        raw = self._run_node_script([from_city, to_city, travel_date or ""], timeout=45.0)
-        parsed = self._parse_transport_options(raw.get("results", []), from_city, to_city)
+        import asyncio
+
+        raw = asyncio.run(self._search_tongcheng_api(from_city, to_city, travel_date or ""))
+        parsed = self._parse_transport_options(raw.get("trains", []), from_city, to_city)
         parsed.sort(key=lambda x: (x.price, x.duration_min))
         return parsed[:12]
 
     def build_booking_url(self, from_city: str, to_city: str, travel_date: str) -> str:
+        dep = self.STATION_CODES.get(from_city, "")
+        arr = self.STATION_CODES.get(to_city, "")
         return (
-            "https://kyfw.12306.cn/otn/leftTicket/init?linktypeid=dc"
-            f"&fs={quote(from_city)}&ts={quote(to_city)}&date={quote(travel_date)}"
+            "https://www.ly.com/mergetrain/book1"
+            f"?depStation={quote(dep)}&arrStation={quote(arr)}&depDate={quote(travel_date)}"
+            f"&depStationName={quote(from_city)}&arrStationName={quote(to_city)}&type=ADULT"
         )
 
-    async def _run_node_script_async(self, args: list[str], timeout: Optional[float] = None) -> dict:
-        """异步版本，不阻塞事件循环"""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "node", str(self.script_path), *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(self.project_dir),
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout or self.timeout)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.communicate()
-                return {"error": "timeout", "results": [], "notes": ["12306 查询超时。"]}
-            output = (stdout.decode("utf-8", errors="replace").strip() or
-                      stderr.decode("utf-8", errors="replace").strip() or "{}")
-            try:
-                return json.loads(output)
-            except json.JSONDecodeError:
-                return {"error": "invalid_json", "raw": output[:500], "results": []}
-        except Exception as e:
-            return {"error": str(e), "results": [], "notes": [f"12306 查询异常: {e}"]}
-
-    def _run_node_script(self, args: list[str], timeout: Optional[float] = None) -> dict:
-        try:
-            proc = subprocess.run(
-                ["node", str(self.script_path), *args],
-                cwd=str(self.project_dir),
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout or self.timeout,
-            )
-            output = proc.stdout.strip() or proc.stderr.strip() or "{}"
-            try:
-                return json.loads(output)
-            except json.JSONDecodeError:
-                return {"error": "invalid_json", "raw": output, "results": []}
-        except TimeoutExpired as e:
+    async def _search_tongcheng_api(self, from_city: str, to_city: str, travel_date: str) -> dict:
+        dep = self.STATION_CODES.get(from_city)
+        arr = self.STATION_CODES.get(to_city)
+        if not dep or not arr or not travel_date:
             return {
-                "error": "timeout",
-                "message": str(e),
-                "results": [],
-                "notes": ["12306 查询超时。"],
+                "error": "missing_station_code",
+                "trains": [],
+                "notices": ["同程车站编码缺失或日期为空。"],
             }
+
+        payload = {
+            "depStation": dep,
+            "arrStation": arr,
+            "depDate": travel_date,
+            "type": "ADULT",
+            "traceId": str(int(time.time() * 1000)),
+            "pid": 1,
+            "ts": int(time.time() * 1000),
+        }
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json;charset=UTF-8",
+            "origin": "https://www.ly.com",
+            "referer": self.build_booking_url(from_city, to_city, travel_date),
+            "user-agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
+            ),
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as client:
+                resp = await client.post("https://www.ly.com/trainsearchbffapi/trainSearch", json=payload)
+                data = resp.json()
+        except Exception as e:
+            return {
+                "error": str(e),
+                "trains": [],
+                "notices": [f"同程铁路查询异常: {e}"],
+            }
+
+        if not data.get("success"):
+            return {
+                "error": data.get("errorCode") or "request_failed",
+                "message": data.get("errorMessage", ""),
+                "trains": [],
+                "notices": [f"同程铁路查询失败: {data.get('errorMessage') or data.get('errorCode')}"]
+            }
+
+        result = data.get("data") or {}
+        return {
+            "success": True,
+            "traceId": data.get("traceId") or result.get("traceId"),
+            "depStation": result.get("depStation", dep),
+            "arrStation": result.get("arrStation", arr),
+            "depDate": result.get("depDate", travel_date),
+            "trains": result.get("trains") or [],
+            "notices": [],
+        }
 
     def _parse_results(self, items: list, from_city: str, to_city: str, travel_date: Optional[str]) -> List[dict]:
         parsed = []
         booking_url = self.build_booking_url(from_city, to_city, travel_date or "")
-        # 站点名称映射：允许的出发站/到达站前缀
-        valid_from_prefixes = self._station_prefixes(from_city)
-        valid_to_prefixes = self._station_prefixes(to_city)
         for item in items:
-            from_station = item.get("fromStation", "")
-            to_station = item.get("toStation", "")
-            # 校验站点：出发站必须包含城市名，到达站必须包含目的地城市名
-            if not self._is_valid_station(from_station, from_city, valid_from_prefixes):
+            train_code = str(item.get("trainCode", "") or "")
+            train_type = str(item.get("type", "") or "")
+            train_avs = item.get("trainAvs") or []
+            if not train_code:
                 continue
-            if not self._is_valid_station(to_station, to_city, valid_to_prefixes):
-                continue
-            seat_name, seat_price = self._pick_train_seat(item.get("seats", {}))
-            if seat_price is None:
-                continue
-            duration_min = self._parse_duration_to_min(item.get("duration"))
-            train_no = str(item.get("trainNo", "")).upper()
-            parsed.append(
-                {
-                    "from_city": from_city,
-                    "to_city": to_city,
-                    "mode": "train",
-                    "train_no": train_no,
-                    "train_type": self._train_type(train_no),
-                    "from_station": item.get("fromStation", ""),
-                    "to_station": item.get("toStation", ""),
-                    "depart_time": item.get("departTime", ""),
-                    "arrive_time": item.get("arriveTime", ""),
-                    "duration_text": item.get("duration", ""),
-                    "duration_min": duration_min,
-                    "arrival_day": item.get("arrivalDay", ""),
-                    "seat_type": seat_name,
-                    "price": seat_price,
-                    "availability": self._pick_availability(item.get("seats", {}), seat_name),
-                    "comfort_score": self._comfort_score(train_no),
-                    "transfer_count": 0,
-                    "booking_url": booking_url,
-                }
-            )
-        # 排序：优先 G 高铁（最快），再 D 动车（较慢但便宜），最后普通车
-        # 综合分 = 价格 * 0.5 + 时间(小时) * 5
-        def sort_key(x):
-            type_penalty = (
-                0 if x["train_no"].startswith("G") else
-                1 if x["train_no"].startswith("D") else
-                4
-            )
-            hours = x["duration_min"] / 60.0
-            score = x["price"] * 0.5 + hours * 5
-            return (type_penalty, score)
-        parsed.sort(key=sort_key)
-        return parsed[:20]
+
+            seat_items = []
+            min_price = None
+            for seat in train_avs:
+                seat_info = self._parse_seat(seat)
+                if not seat_info:
+                    continue
+                seat_items.append(seat_info)
+                if min_price is None or seat_info["price"] < min_price:
+                    min_price = seat_info["price"]
+
+            parsed.append({
+                "from_city": from_city,
+                "to_city": to_city,
+                "mode": "train",
+                "train_no": train_code,
+                "train_type": self._normalize_train_type(train_type, item.get("gdc")),
+                "from_station": item.get("depStationName", from_city),
+                "to_station": item.get("arrStationName", to_city),
+                "depart_time": item.get("depTime", ""),
+                "arrive_time": item.get("arrTime", ""),
+                "depart_date": item.get("depDate", travel_date or ""),
+                "arrive_date": item.get("arrDate", travel_date or ""),
+                "arrival_day": item.get("arrivalDays", 0),
+                "duration_text": item.get("runTime", ""),
+                "duration_min": int(item.get("runTimeMin", 0) or 0),
+                "start_station": item.get("startStationName", ""),
+                "end_station": item.get("endStationName", ""),
+                "price": float(min_price) if min_price is not None else None,
+                "seat_summary": seat_items,
+                "booking_url": booking_url,
+                "sale_status": {
+                    "can_buy_now": (item.get("limiter") or {}).get("canByNow"),
+                    "sale_state": (item.get("limiter") or {}).get("saleState"),
+                    "message": (item.get("limiter") or {}).get("message", ""),
+                    "note": (item.get("limiter") or {}).get("note", ""),
+                },
+                "feature_tags": self._feature_tags(item),
+            })
+
+        parsed = [x for x in parsed if x.get("price") is not None]
+        parsed.sort(key=lambda x: (x["price"], x["duration_min"], x["train_no"]))
+        return parsed[:80]
 
     def _parse_transport_options(self, items: list, from_city: str, to_city: str) -> List[TransportOption]:
         parsed = []
         for item in items:
-            _, seat_price = self._pick_train_seat(item.get("seats", {}))
-            if seat_price is None:
+            min_price = None
+            for seat in item.get("trainAvs") or []:
+                seat_price = seat.get("price")
+                if isinstance(seat_price, (int, float)) and seat_price > 0:
+                    if min_price is None or seat_price < min_price:
+                        min_price = float(seat_price)
+            duration_min = int(item.get("runTimeMin", 0) or 0)
+            if min_price is None or duration_min <= 0:
                 continue
-            duration_min = self._parse_duration_to_min(item.get("duration"))
-            if duration_min <= 0:
-                continue
-            train_no = str(item.get("trainNo", "")).upper()
             parsed.append(
                 TransportOption(
                     from_city=from_city,
                     to_city=to_city,
                     mode="train",
-                    price=float(seat_price),
+                    price=min_price,
                     duration_min=duration_min,
-                    comfort_score=self._comfort_score(train_no),
+                    comfort_score=self._comfort_score(str(item.get("trainCode", "")), str(item.get("type", ""))),
                     transfer_count=0,
                 )
             )
         return parsed
 
     def classify_train(self, option: TransportOption) -> str:
-        train_no = self._extract_train_no_from_option(option)
-        return self._train_type(train_no)
+        return "high_speed" if option.comfort_score >= 0.85 else "normal"
 
     def score_transport_option(self, option: TransportOption, pace: str = "balanced") -> float:
-        train_type = self.classify_train(option)
-        duration_penalty = option.duration_min * (0.12 if train_type == "high_speed" else 0.18)
+        duration_penalty = option.duration_min * 0.12
         price_penalty = option.price * (0.9 if pace == "budget" else 1.0)
-        type_bias = 0 if train_type == "high_speed" else 55
-        return price_penalty + duration_penalty + type_bias
+        return price_penalty + duration_penalty
 
-    def _extract_train_no_from_option(self, option: TransportOption) -> str:
-        return getattr(option, "train_no", "") or ""
-
-    def _train_type(self, train_no: str) -> str:
-        if train_no.startswith("G"):
-            return "high_speed"
-        if train_no.startswith("D"):
-            return "intercity"
-        return "normal"
-
-    def _station_prefixes(self, city: str) -> list[str]:
-        """返回站点名称的有效前缀列表"""
-        # 常见城市名变体
-        mapping = {
-            "上海": ["上海", "上海虹桥", "上海南", "上海西"],
-            "苏州": ["苏州", "苏州北", "苏州南", "苏州园区"],
-            "西安": ["西安", "西安北", "西安南"],
-            "北京": ["北京", "北京南", "北京西", "北京北", "北京东"],
-            "南京": ["南京", "南京南", "南京东"],
-            "杭州": ["杭州", "杭州东", "杭州南", "杭州西"],
-            "成都": ["成都", "成都东", "成都南", "成都西"],
-            "广州": ["广州", "广州南", "广州东", "广州北"],
-            "深圳": ["深圳", "深圳北", "深圳东", "深圳西"],
+    def _parse_seat(self, seat: dict) -> Optional[dict]:
+        price = seat.get("price")
+        if not isinstance(price, (int, float)) or price <= 0:
+            return None
+        code = str(seat.get("seatClassCode", "") or "")
+        return {
+            "seat_code": code,
+            "seat_name": self.SEAT_CLASS_MAP.get(code, code or "未知座席"),
+            "price": float(price),
+            "availability": seat.get("num", ""),
+            "candidate": bool(seat.get("candidate")),
+            "berth_selectable": bool(seat.get("berthSelectable")),
+            "student_bookable": bool(seat.get("stuBookable")),
+            "student_price": seat.get("stuPrice"),
         }
-        return mapping.get(city, [city])
 
-    def _is_valid_station(self, station: str, city: str, valid_prefixes: list[str]) -> bool:
-        """校验站点名称是否属于该城市"""
-        if not station:
-            return False
-        # 站点名必须包含城市名，或者在有效前缀列表中
-        if city in station:
-            return True
-        for prefix in valid_prefixes:
-            if station.startswith(prefix) or station == prefix:
-                return True
-        return False
+    def _feature_tags(self, item: dict) -> list[str]:
+        tags = []
+        feature = item.get("feature") or {}
+        if item.get("gdc"):
+            tags.append("高铁/动车")
+        if feature.get("checkInByIdCard"):
+            tags.append("身份证进站")
+        if feature.get("containSelectableBerth"):
+            tags.append("可选铺")
+        if feature.get("payByPoint") == "Y":
+            tags.append("积分支付")
+        if (item.get("limiter") or {}).get("saleState") == "1":
+            tags.append("暂停发售")
+        return tags
 
-    def _pick_train_seat(self, seats: dict) -> tuple[str, Optional[float]]:
-        """按舒适度优先级选座：高铁/动车选二等座，普速选硬卧/硬座。无座仅当万不得已时选。"""
-        # 第一优先级：二等座（高铁/动车首选）
-        for seat_name in ["二等座", "一等座", "商务座"]:
-            seat = seats.get(seat_name)
-            if isinstance(seat, dict):
-                price = seat.get("price")
-                avail = seat.get("availability", "")
-                if isinstance(price, (int, float)) and price > 0 and avail not in ("--",):
-                    return seat_name, float(price)
-        # 第二优先级：硬座/硬卧（普速首选）
-        for seat_name in ["硬座", "硬卧", "软卧", "一等座"]:
-            seat = seats.get(seat_name)
-            if isinstance(seat, dict):
-                price = seat.get("price")
-                avail = seat.get("availability", "")
-                if isinstance(price, (int, float)) and price > 0 and avail not in ("--",):
-                    return seat_name, float(price)
-        # 第三优先级：任意有票的座位（排除无效占位符 "--"）
-        for seat_name, seat in seats.items():
-            if not isinstance(seat, dict):
-                continue
-            price = seat.get("price")
-            avail = seat.get("availability", "")
-            if isinstance(price, (int, float)) and price > 0 and avail not in ("--",):
-                return seat_name, float(price)
-        return "", None
+    def _normalize_train_type(self, train_type: str, gdc: Optional[bool]) -> str:
+        if train_type in {"GD", "D"} or gdc:
+            return "high_speed"
+        if train_type in {"Z", "KT", "PK"}:
+            return "normal"
+        return train_type.lower() if train_type else "train"
 
-    def _pick_availability(self, seats: dict, seat_name: str) -> str:
-        seat = seats.get(seat_name, {}) if isinstance(seats, dict) else {}
-        if isinstance(seat, dict):
-            return str(seat.get("availability", ""))
-        return ""
-
-    def _parse_duration_to_min(self, value: Optional[str]) -> int:
-        if not value or ":" not in value:
-            return 0
-        try:
-            hh, mm = value.split(":", 1)
-            return int(hh) * 60 + int(mm)
-        except Exception:
-            return 0
-
-    def _comfort_score(self, train_no: str) -> float:
-        if train_no.startswith("G"):
+    def _comfort_score(self, train_code: str, train_type: str) -> float:
+        if train_type in {"GD", "D"} or train_code.startswith(("G", "D")):
             return 0.88
-        if train_no.startswith("D"):
-            return 0.8
+        if train_type in {"Z", "KT"}:
+            return 0.65
         return 0.58

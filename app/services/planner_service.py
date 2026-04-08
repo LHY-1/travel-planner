@@ -296,11 +296,28 @@ class PlannerService:
             if not all_options:
                 return None, [], f"{from_c}→{to_c} 交通查询失败"
             
-            # 按评分排序
+            # 主展示仍选一个默认项，但候选列表尽量保留，不再按混合总分硬截断
             scored = [(opt, self._score_transport(opt, req.pace, leg_idx)) for opt in all_options]
             scored.sort(key=lambda x: x[1])
             chosen = scored[0][0]
-            return chosen, [s[0] for s in scored[:5]], None  # 返回前5个选项
+
+            deduped = []
+            seen_keys = set()
+            for opt, _score in scored:
+                uniq = (
+                    opt.get('mode') or ('flight' if opt.get('flight_no') else 'train'),
+                    opt.get('train_no') or opt.get('flight_no') or '',
+                    opt.get('depart_time') or '',
+                    opt.get('arrive_time') or '',
+                    float(opt.get('price') or 0),
+                )
+                if uniq in seen_keys:
+                    continue
+                deduped.append(opt)
+                seen_keys.add(uniq)
+                if len(deduped) >= 30:
+                    break
+            return chosen, deduped, None
 
         # ── Step 3: 先查询所有交通段 ─────────────────────────────────────────────
         segment_transports: list[dict] = []
@@ -511,11 +528,20 @@ class PlannerService:
                 ))
                 day_counter += 1
 
-        # 返程：合并到最后一个城市的最后一天
-        # 注意：返程交通已经在上面循环中处理了（当 city_idx == len(route_cities) - 1 时，local_day == days_in_city - 1）
-        # 所以这里不需要额外加一天，只需要确保返程交通正确显示
-        # 返程交通 = segment_transports[-1]，对应最后一个城市出发
-        # 已经在上面循环中处理，这里不需要额外代码
+        # 纯起终点直达场景，补一条可展示的交通日
+        if not daily_itinerary and segment_transports:
+            t = dict(segment_transports[0])
+            date_str = actual_departure_date.strftime("%Y-%m-%d")
+            daily_itinerary.append(DailyItem(
+                day=1,
+                date=date_str,
+                city=route[-1],
+                theme="前往目的地",
+                action=f"{route[0]} → {route[-1]}",
+                transport=t,
+                transport_options=segment_options[0] if segment_options else [t],
+                timeline=[],
+            ))
 
         segments: list[Segment] = []
         total_cost = 0.0

@@ -239,7 +239,7 @@
   </div>
 </div>
 
-<div class="version" onclick="showChangelog()" title="更新日志">v1.3.7</div>
+<div class="version" onclick="showChangelog()" title="更新日志">v1.4.4</div>
 <div id="changelogModal" class="modal" style="display:none">
   <div class="modal-content">
     <div class="modal-header">
@@ -248,10 +248,24 @@
     </div>
     <div class="modal-body">
       <div class="version-item">
-        <div class="version-num">v1.3.7 (20260405-1630)</div>
-        <div class="version-date">2026-04-05</div>
+        <div class="version-num">v1.4.4 (20260408-2158)</div>
+        <div class="version-date">2026-04-08</div>
         <ul class="version-list">
-          <li>恢复中文界面</li>
+          <li>修复交通详情面板引用未定义变量导致的前端报错</li>
+          <li>修复更新日志弹窗多余闭合标签</li>
+          <li>新增 VERSION 和 CHANGELOG.md，后续版本与更新说明持续追加保留</li>
+        </ul>
+      </div>
+      <div class="version-item">
+        <div class="version-num">v1.4.3 (20260408-2055)</div>
+        <div class="version-date">2026-04-08</div>
+        <ul class="version-list">
+          <li>交通候选改为默认折叠展示</li>
+          <li>分类固定为：飞机 / 高铁动车 / 普速</li>
+          <li>展开后支持按时间、按价格排序</li>
+          <li>铁路数据切换为同程 trainSearch</li>
+          <li>修复草案 / 生成计划按钮失效问题</li>
+          <li>更新前端缓存版本号</li>
         </ul>
       </div>
       <div class="version-item">
@@ -356,6 +370,6 @@ function applyPacePreset() {
 }
 </script>
 
-<script src="/static/fix_renderplan.js?v=20260405-1715"></script>
+<script src="/static/fix_renderplan.js?v=20260408-2158"></script>
 </body>
 </html>
